@@ -204,7 +204,7 @@ hooks to an old session that you then resume, its old messages are logged
 once.
 
 **Redaction.** Before it writes, `memo` replaces each of these with
-`[REDACTED]` (in `user`, `unii`, `tool` and `echo` text, before the clip):
+`[REDACTED]` (in `user`, `unii`, `tool` and `echo` text, after the clip of `tool` and `echo`):
 
 1. A private key block: from `-----BEGIN ... PRIVATE KEY-----` to the
    matching `END` line, or to the end of the text if the block is cut.
