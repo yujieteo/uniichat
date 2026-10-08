@@ -1,0 +1,11 @@
+{
+  "session_id": "@SID@",
+  "transcript_path": "@FILE@",
+  "cwd": "/work/app",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "Done: upload() now retries 3 times.\nTests pass.",
+  "background_tasks": [],
+  "session_crons": []
+}

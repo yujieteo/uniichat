@@ -4,6 +4,7 @@ Run:  python3 tests/test_memo.py        (prints each test's time)
       python3 -m unittest discover -s tests -v
 """
 
+import atexit
 import contextlib
 import fcntl
 import importlib.machinery
@@ -11,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -18,6 +20,11 @@ import threading
 import time
 import unittest
 from unittest import mock
+
+_SANDBOX = tempfile.mkdtemp(prefix="memo-test-home-")
+atexit.register(shutil.rmtree, _SANDBOX, ignore_errors=True)
+os.environ["HOME"] = _SANDBOX
+os.environ["UNIICHAT_DIR"] = os.path.join(_SANDBOX, "chat")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _loader = importlib.machinery.SourceFileLoader(
@@ -27,6 +34,15 @@ memo = importlib.util.module_from_spec(
 _loader.exec_module(memo)
 
 os.environ["UNIICHAT_NO_WORKER"] = "1"
+for _var in ("FM_TASK_ID", "NO_MISTAKES_GATE", "PI_SESSION_ID", "CODEX_THREAD_ID",
+             "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "UNIICHAT_BACKEND",
+             "UNIICHAT_MODEL", "UNIICHAT_PROVIDER", "UNIICHAT_THINKING"):
+    os.environ.pop(_var, None)  # a test runs in the environment of no session
+
+
+class SandboxTest(unittest.TestCase):
+    def test_default_store_is_in_sandbox(self):
+        self.assertTrue(memo.default_store().startswith(_SANDBOX + os.sep))
 
 
 def taelin_push(new, states):
@@ -533,16 +549,96 @@ class Compactions(Base):
         self.add("q" * 600)
         with mock.patch.dict(os.environ, {"UNIICHAT_NO_WORKER": ""}), \
                 mock.patch.object(memo.subprocess, "Popen") as popen:
+            memo.kick_worker(self.store)  # the agent writes the lines: no worker
+            self.assertEqual(popen.call_count, 0)
+        with mock.patch.dict(os.environ, {"UNIICHAT_NO_WORKER": "",
+                                          "UNIICHAT_BACKEND": "pi"}), \
+                mock.patch.object(memo.subprocess, "Popen") as popen:
             memo.kick_worker(self.store)
             self.assertEqual(popen.call_count, 1)
             self.assertEqual(popen.call_args[0][0][-1], "compact")
             self.assertEqual(popen.call_args[0][0][-3:-1],
                              ["--store", self.store.path])
         self.build()
-        with mock.patch.dict(os.environ, {"UNIICHAT_NO_WORKER": ""}), \
+        with mock.patch.dict(os.environ, {"UNIICHAT_NO_WORKER": "",
+                                          "UNIICHAT_BACKEND": "pi"}), \
                 mock.patch.object(memo.subprocess, "Popen") as popen:
             memo.kick_worker(self.store)
             self.assertEqual(popen.call_count, 0)
+
+
+# ------------------------------------------------------------ the agent writes the lines
+
+class AgentWrites(Base):
+    """No model is called: memo shows the next compaction, the agent answers."""
+
+    def say(self, *argv):
+        code, out = self.run_cli(*argv)
+        self.assertEqual(code, 0, out)
+        return out
+
+    def test_note_asks_for_a_compaction_and_the_line_comes_back_by_line(self):
+        out = self.say("note", "first " + "x" * 600)
+        self.assertIn("Saved as #0.", out)
+        self.assertIn(memo.ASK, out)
+        self.assertIn("--- 0+1 ---\nCompaction: compress message 0 into one line "
+                      "of at most 512 bytes", out)
+        self.assertIn(memo.RULER, out)
+        self.assertIn("note: first xxx", out)
+        self.assertEqual(self.say("task").count("--- 0+1 ---"), 1)  # asks again
+        self.assertIn("Saved line 0+1 (15 bytes).",
+                      self.say("line", "0+1", "0+1|note: first one"))
+        self.assertEqual(self.store.tree.get(0, 0), "note: first one")  # head cut
+        self.assertIn("0+1|note: first one\n", self.say("wake"))
+        self.assertIn("already written", self.say("line", "0+1", "again"))
+        self.assertEqual(self.say("task"), "No compaction is pending.\n")
+        # a merge is asked only when both halves are written; stdin works
+        self.say("note", "second " + "y" * 600)
+        self.say("line", "1+1", "note: second one " + "z" * 480)
+        out = self.say("task")
+        self.assertIn("--- 0+2 ---\nCompaction: merge lines 0+1 and 1+1", out)
+        self.assertNotIn("<chat>", out)
+        with mock.patch.object(sys, "stdin", io.StringIO("merged line\n")):
+            self.say("line", "0+2", "-")
+        self.assertEqual(self.store.tree.get(1, 0), "merged line")
+
+    def test_a_long_line_gets_the_cut_and_five_tries_then_the_shortest_stays(self):
+        self.say("note", "m " + "x" * 600)
+        out = self.say("line", "0+1", "a" * 700)
+        self.assertIn("Too long: your line is 700 bytes, over the 512-byte limit",
+                      out)
+        self.assertIn("a" * 512 + "| \u2190 LIMIT", out)
+        self.assertIsNone(self.store.tree.get(0, 0))
+        for n in (650, 520, 800):
+            self.assertIn("Too long", self.say("line", "0+1", "b" * n))
+        out = self.say("line", "0+1", "c" * 900)  # the fifth try
+        self.assertIn("Saved line 0+1 (520 bytes, over 512 after 5 tries).", out)
+        self.assertEqual(self.store.tree.get(0, 0), "b" * 520)
+        for bad in (("line", "0+1"), ("line", "3+2", "x"), ("line", "0+1", " "),
+                    ("line", "4+4", "x")):
+            self.assertEqual(self.run_cli(*bad)[0], 1, bad)
+
+    def test_parallel_agents_are_shown_different_tasks_and_wake_asks_for_three(self):
+        for k in range(5):
+            self.add("m%d " % k + "x" * 600)
+        first = self.say("task", "2")
+        second = self.say("task", "2")
+        self.assertEqual(re.findall(r"--- (\d+\+1) ---", first), ["0+1", "1+1"])
+        self.assertEqual(re.findall(r"--- (\d+\+1) ---", second), ["2+1", "3+1"])
+        out = self.say("wake")
+        self.assertEqual(re.findall(r"--- (\d+\+1) ---", out), ["4+1", "0+1", "1+1"])
+        self.assertTrue(out.rstrip().endswith("</chat>"))  # the view still ends it
+        self.assertLess(out.index("--- 4+1 ---"), out.index("<chat>"))
+
+    def test_compact_runs_no_model_unless_one_is_opted_in(self):
+        self.add("m " + "x" * 600)
+        with mock.patch.object(memo.subprocess, "run") as run, \
+                mock.patch.object(memo.urllib.request, "urlopen") as url:
+            out = self.say("compact")
+        self.assertIn("The agent writes the lines", out)
+        run.assert_not_called()
+        url.assert_not_called()
+        self.assertEqual(self.store.load().msgs, [0])
 
 
 # ------------------------------------------------------------ commands
@@ -595,12 +691,12 @@ class Commands(Base):
             code, out = self.run_cli("wake")
             self.assertIn("Not awake yet. Run:", out)
             self.assertNotIn("</chat>", out)
-            seen = [l for l in out.splitlines() if l[:1].isdigit()]
+            seen = [l for l in out.splitlines() if re.match(r"\d+\+\d+\|", l)]
             while "Not awake yet" in out:
                 tail = out.splitlines()[-1].split(" wake ")[1].split()
                 code, out = self.run_cli("wake", *tail)
                 self.assertEqual(code, 0)
-                seen += [l for l in out.splitlines() if l[:1].isdigit()]
+                seen += [l for l in out.splitlines() if re.match(r"\d+\+\d+\|", l)]
             self.assertTrue(out.rstrip().endswith("</chat>"))
             self.assertEqual(len(seen), 30)
             self.assertEqual(self.run_cli("wake", "3", "99")[0], 1)
@@ -768,9 +864,11 @@ class Backends(unittest.TestCase):
                 {"type": "text", "text": "x" * 600 if len(sent) == 1
                  else "short"}]}).encode())
 
-        cfg = memo.Config({"ANTHROPIC_API_KEY": "test-key"})
-        self.assertEqual((cfg.backend, cfg.model),
-                         ("api", "claude-haiku-4-5-20251001"))
+        cfg = memo.Config({"UNIICHAT_BACKEND": "api",
+                           "UNIICHAT_MODEL": "claude-haiku-4-5-20251001",
+                           "ANTHROPIC_API_KEY": "test-key"})
+        self.assertEqual((cfg.backend, cfg.model, cfg.provider),
+                         ("api", "claude-haiku-4-5-20251001", "anthropic"))
         conv = memo.ApiBackend(cfg, opener).conversation(
             "SYS", ["%d+1|line %d" % (k, k) for k in range(10)], "TASK")
         self.assertEqual(conv.ask(), "x" * 600)
@@ -801,23 +899,40 @@ class Backends(unittest.TestCase):
         blocks = memo.render_blocks([], "T")
         self.assertEqual(blocks[0]["text"], "<chat>\n</chat>\nT")
 
-    def test_backend_choice(self):
-        self.assertEqual(memo.Config({}).backend, "pi")
-        self.assertEqual(memo.Config({"ANTHROPIC_API_KEY": "k"}).backend, "api")
-        self.assertEqual(memo.Config({"ANTHROPIC_API_KEY": "k",
-                                      "UNIICHAT_BACKEND": "pi"}).backend, "pi")
+    def test_no_model_is_called_by_default_and_no_key_is_looked_up(self):
+        with mock.patch.object(memo.subprocess, "run") as run, \
+                mock.patch.object(memo, "_pi_key", {}), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            cfg = memo.Config()
+        run.assert_not_called()
+        self.assertEqual((cfg.backend, cfg.key), ("agent", None))
         with self.assertRaises(memo.Die):
-            memo.Config({"UNIICHAT_BACKEND": "api"})
+            memo.make_backend(cfg)
+        # a key in the environment does not turn a model on
+        cfg = memo.Config({"ANTHROPIC_API_KEY": "k"})
+        self.assertEqual(cfg.backend, "agent")
 
-    def test_key_comes_from_pi_once_when_the_env_has_none(self):
+    def test_models_are_opt_in_haiku_is_the_api_default(self):
+        cfg = memo.Config({"UNIICHAT_BACKEND": "api", "ANTHROPIC_API_KEY": "k"})
+        self.assertEqual((cfg.provider, cfg.model, cfg.thinking, cfg.backend),
+                         ("anthropic", "claude-haiku-4-5-20251001", "xhigh", "api"))
+        self.assertIsInstance(memo.make_backend(cfg), memo.ApiBackend)
+        for bad in ({"UNIICHAT_BACKEND": "model"},
+                    {"UNIICHAT_BACKEND": "api"},  # no key
+                    {"UNIICHAT_THINKING": "cut"}):
+            with self.assertRaises(memo.Die, msg=bad):
+                memo.Config(bad)
+
+    def test_opt_in_key_comes_from_the_env_else_from_pi_once_per_provider(self):
         calls = []
 
         def run(cmd, **kw):
             calls.append(cmd)
             return mock.Mock(returncode=0, stdout="sk-test-123\n", stderr="")
 
-        with mock.patch.object(memo, "_pi_key", []), \
-                mock.patch.dict(os.environ, {}, clear=True), \
+        env = {"UNIICHAT_BACKEND": "auto"}
+        with mock.patch.object(memo, "_pi_key", {}), \
+                mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(memo.subprocess, "run", run):
             a, b = memo.Config(), memo.Config()
         self.assertEqual((a.backend, a.key, b.key),
@@ -825,24 +940,16 @@ class Backends(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1:], ["auth", "print-api-key", "--provider",
                                         "anthropic"])
-
-    def test_env_key_wins_and_no_key_falls_back_to_the_pi_cli(self):
-        with mock.patch.object(memo.subprocess, "run") as run, \
-                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env"}):
+        with mock.patch.object(memo.subprocess, "run") as run2, \
+                mock.patch.dict(os.environ, dict(env, ANTHROPIC_API_KEY="sk-env"),
+                                clear=True):
             self.assertEqual(memo.Config().key, "sk-env")
-            run.assert_not_called()
+            run2.assert_not_called()
         fail = mock.Mock(returncode=1, stdout="", stderr="no key")
-        with mock.patch.object(memo, "_pi_key", []), \
-                mock.patch.dict(os.environ, {}, clear=True), \
+        with mock.patch.object(memo, "_pi_key", {}), \
+                mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(memo.subprocess, "run", return_value=fail):
-            cfg = memo.Config()
-        self.assertEqual((cfg.backend, cfg.key), ("pi", None))
-        with mock.patch.object(memo, "_pi_key", []), \
-                mock.patch.dict(os.environ, {"UNIICHAT_BACKEND": "pi"},
-                                clear=True), \
-                mock.patch.object(memo.subprocess, "run") as run:
-            self.assertEqual(memo.Config().backend, "pi")
-            run.assert_not_called()
+            self.assertEqual(memo.Config().backend, "pi")  # no key: pi
 
     def test_pi_command_line(self):
         calls = []
@@ -851,20 +958,31 @@ class Backends(unittest.TestCase):
             calls.append((cmd, kw))
             return mock.Mock(returncode=0, stdout="ok\n", stderr="")
 
-        cfg = memo.Config({})
+        def arg(cmd, name):
+            return cmd[cmd.index(name) + 1]
+
+        pi = memo.Config({"UNIICHAT_BACKEND": "pi",
+                          "UNIICHAT_THINKING": "low"})
         with mock.patch.object(memo.subprocess, "run", run):
-            conv = memo.PiBackend(cfg).conversation("SYS", ["0+1|a"], "TASK")
+            conv = memo.PiBackend(pi).conversation("SYS", ["0+1|a"], "TASK")
             self.assertEqual(conv.ask(), "ok")
             conv.followup("again")
             conv.close()
-        first, second = calls
+            memo.PiBackend(memo.Config({"UNIICHAT_BACKEND": "pi"})
+                           ).conversation("S", [], "T").ask()
+        first, second, haiku = calls
         self.assertIn("--no-extensions", first[0])
-        self.assertIn("claude-haiku-4-5-20251001", first[0])
-        self.assertIn("xhigh", first[0])
+        self.assertEqual((arg(first[0], "--provider"), arg(first[0], "--model")),
+                         ("anthropic", "claude-haiku-4-5-20251001"))
+        self.assertEqual(arg(first[0], "--thinking"), "low")
+        self.assertEqual(arg(second[0], "--thinking"), "low")
         self.assertNotIn("--continue", first[0])
         self.assertIn("--continue", second[0])
         self.assertEqual(first[1]["input"], "<chat>\n0+1|a\n</chat>\nTASK")
         self.assertEqual(second[1]["input"], "again")
+        self.assertEqual((arg(haiku[0], "--provider"), arg(haiku[0], "--model"),
+                          arg(haiku[0], "--thinking")),
+                         ("anthropic", "claude-haiku-4-5-20251001", "xhigh"))
 
 
 class Timed(unittest.TextTestResult):
