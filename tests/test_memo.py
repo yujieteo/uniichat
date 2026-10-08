@@ -4,6 +4,7 @@ Run:  python3 tests/test_memo.py        (prints each test's time)
       python3 -m unittest discover -s tests -v
 """
 
+import atexit
 import contextlib
 import fcntl
 import importlib.machinery
@@ -20,6 +21,11 @@ import time
 import unittest
 from unittest import mock
 
+_SANDBOX = tempfile.mkdtemp(prefix="memo-test-home-")
+atexit.register(shutil.rmtree, _SANDBOX, ignore_errors=True)
+os.environ["HOME"] = _SANDBOX
+os.environ["UNIICHAT_DIR"] = os.path.join(_SANDBOX, "chat")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 _loader = importlib.machinery.SourceFileLoader(
     "memo", os.path.join(HERE, "..", "memo"))
@@ -32,6 +38,11 @@ for _var in ("FM_TASK_ID", "NO_MISTAKES_GATE", "PI_SESSION_ID", "CODEX_THREAD_ID
              "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "UNIICHAT_BACKEND",
              "UNIICHAT_MODEL", "UNIICHAT_PROVIDER", "UNIICHAT_THINKING"):
     os.environ.pop(_var, None)  # a test runs in the environment of no session
+
+
+class SandboxTest(unittest.TestCase):
+    def test_default_store_is_in_sandbox(self):
+        self.assertTrue(memo.default_store().startswith(_SANDBOX + os.sep))
 
 
 def taelin_push(new, states):
