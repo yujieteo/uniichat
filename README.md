@@ -142,6 +142,8 @@ the first version and stay off by default:
 | `UNIICHAT_MODEL` | `claude-haiku-4-5-20251001` |
 | `UNIICHAT_THINKING` | `off minimal low medium high xhigh max`; default `xhigh` |
 | `UNIICHAT_PI` | the `pi` command |
+| `UNIICHAT_TIMEOUT` | seconds to wait for one model call; default `300` |
+| `UNIICHAT_NO_WORKER` | if set, no background `memo compact` starts |
 
 The key comes from `ANTHROPIC_API_KEY`. If it is not
 set, the tool runs `pi auth print-api-key --provider PROVIDER` once per
