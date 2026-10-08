@@ -647,8 +647,10 @@ class Commands(Base):
 
     def test_status(self):
         self.fill(3)
-        code, out = self.run_cli("status")
+        with mock.patch.dict(os.environ, {"UNIICHAT_BACKEND": "pi"}):
+            code, out = self.run_cli("status")
         self.assertIn("messages   3", out)
+        self.assertIn("via pi", out)
 
     def test_compact_command_uses_the_backend(self):
         self.add("x" * 600)
