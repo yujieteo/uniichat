@@ -139,38 +139,23 @@ the first version and stay off by default:
 | Setting | Value |
 | --- | --- |
 | `UNIICHAT_BACKEND` | `api`: the provider's own API. `pi`: `pi --no-extensions -p`. `auto`: `api` if a key is found, else `pi`. |
-| `UNIICHAT_PROVIDER` | `anthropic` (default), or `deepseek`; a model name that starts with `deepseek` also selects it |
-| `UNIICHAT_MODEL` | `claude-haiku-4-5-20251001` (anthropic), `deepseek-flash` (deepseek) |
-| `UNIICHAT_THINKING` | `off minimal low medium high xhigh max`; default `xhigh` (anthropic). DeepSeek also has `cut`, its default: no thinking for the first line, thinking only to cut a line that is too long |
+| `UNIICHAT_MODEL` | `claude-haiku-4-5-20251001` |
+| `UNIICHAT_THINKING` | `off minimal low medium high xhigh max`; default `xhigh` |
 | `UNIICHAT_PI` | the `pi` command |
 
-The key comes from `ANTHROPIC_API_KEY` or `DEEPSEEK_API_KEY`. If it is not
+The key comes from `ANTHROPIC_API_KEY`. If it is not
 set, the tool runs `pi auth print-api-key --provider PROVIDER` once per
 process and keeps the key in memory. The tool never stores, logs or prints
-the key. `ANTHROPIC_BASE_URL` and `DEEPSEEK_BASE_URL` change the API address.
+the key. `ANTHROPIC_BASE_URL` changes the API address.
 With a backend on, each `wake`, `note`, `zoom`, `date` and `import` also starts
 one background `memo compact` if lines are pending and none runs; its output
 goes to `worker.log`. The 512-byte ruler, the cut and the 5 tries are the same
-as for the agent. The Anthropic path marks the cache as the design says (the
-view in blocks of 4 lines, one mark on the last whole block and one on the
-end). The DeepSeek path keeps the same prefix in each call (system prompt,
-then view and task as one message), because DeepSeek caches it by itself, and
-it has no cache marks. If a DeepSeek call with thinking returns no text (it
-used all `max_tokens` to think), the tool asks again without thinking.
-`DeepSeek` through the direct API: model `deepseek-flash`.
+as for the agent. The `api` backend marks the cache as the design says (the view in blocks of
+4 lines, one mark on the last whole block and one on the end).
 
 The system prompt of the model backends is the design prompt, with Unii
 renamed to OptMem. The paragraph about computers and the `zoom("Name")` line
 are removed.
-
-Measured with the model backends, 20 synthetic compactions (16 messages, 4
-merges), 2026-10-08:
-
-| Model, thinking | Failed | Over 512 after 5 tries | Mean line | Cost of 20 |
-| --- | --- | --- | --- | --- |
-| DeepSeek, `cut` | 0 | 0 | 453 bytes | $0.054 |
-| DeepSeek, `off` | 0 | 4 | 465 bytes | $0.022 |
-| Haiku 4.5, `xhigh` | 0 | 0 | 398 bytes | $0.175 |
 
 ## Capture
 
@@ -257,7 +242,7 @@ once.
    matching `END` line, or to the end of the text if the block is cut.
 2. The `user:password` part of a URL, in `scheme://user:password@host`.
 3. These token formats: `sk-` followed by 20 or more letters, digits, `_` or
-   `-` (OpenAI, Anthropic, DeepSeek and others); `ghp_`, `gho_`, `ghu_`,
+   `-` (OpenAI, Anthropic and others); `ghp_`, `gho_`, `ghu_`,
    `ghs_`, `ghr_` with 30 or more letters or digits; `github_pat_` with 20 or
    more; `glpat-` with 20 or more; `AKIA` or `ASIA` with 16 capitals or
    digits; `xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-` with 10 or more;

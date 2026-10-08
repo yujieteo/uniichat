@@ -681,18 +681,9 @@ THINKING = {"off": 0, "minimal": 1024, "low": 2048, "medium": 4096,
 
 # The models of the opt-in backends (UNIICHAT_BACKEND=api|pi). By default no
 # model is called: the agent of the session writes the lines (memo task/line).
-PROVIDERS = {
-    "deepseek": {"model": "deepseek-flash", "thinking": "cut",
-                 "key": "DEEPSEEK_API_KEY", "url": "https://api.deepseek.com",
-                 "url_env": "DEEPSEEK_BASE_URL"},
-    "anthropic": {"model": "claude-haiku-4-5-20251001", "thinking": "xhigh",
-                  "key": "ANTHROPIC_API_KEY", "url": "https://api.anthropic.com",
-                  "url_env": "ANTHROPIC_BASE_URL"},
-}
-DEEPSEEK_LINE_TOKENS = 1024  # max_tokens for the line, with no thinking
-# UNIICHAT_THINKING for DeepSeek: off (never think), cut (the default for
-# DeepSeek: no thinking for the first line, thinking when the model must cut
-# a line that was too long), or a level (think on every call, as Anthropic).
+PROVIDER = "anthropic"
+MODEL = "claude-haiku-4-5-20251001"
+THINKING_DEFAULT = "xhigh"
 
 _pi_key = {}
 
@@ -725,38 +716,27 @@ class Config:
         (the provider's own API), pi (`pi -p`), auto (api if a key is found,
         else pi). env=None reads the real environment, and asks pi for a key
         when the provider's key variable is unset. A given dict is used as
-        it is. The provider is UNIICHAT_PROVIDER, else the one the
-        UNIICHAT_MODEL name belongs to (claude..., deepseek...), else
-        anthropic."""
+        it is."""
         real = env is None
         env = os.environ if real else env
-        model = env.get("UNIICHAT_MODEL") or ""
-        provider = env.get("UNIICHAT_PROVIDER") or (
-            "deepseek" if model.startswith("deepseek") else "anthropic")
-        if provider not in PROVIDERS:
-            raise Die("UNIICHAT_PROVIDER is anthropic or deepseek, not %s."
-                      % provider)
-        spec = PROVIDERS[provider]
-        self.provider = provider
-        self.model = model or spec["model"]
-        self.thinking = env.get("UNIICHAT_THINKING") or spec["thinking"]
-        if self.thinking not in THINKING and not (
-                provider == "deepseek" and self.thinking == "cut"):
-            raise Die("UNIICHAT_THINKING is one of: %s%s." % (
-                " ".join(THINKING), " cut" if provider == "deepseek" else ""))
+        self.provider = PROVIDER
+        self.model = env.get("UNIICHAT_MODEL") or MODEL
+        self.thinking = env.get("UNIICHAT_THINKING") or THINKING_DEFAULT
+        if self.thinking not in THINKING:
+            raise Die("UNIICHAT_THINKING is one of: %s." % " ".join(THINKING))
         want = env.get("UNIICHAT_BACKEND") or "agent"
         if want not in BACKENDS:
             raise Die("UNIICHAT_BACKEND is %s, not %s."
                       % (", ".join(BACKENDS), want))
-        self.key = env.get(spec["key"])
+        self.key = env.get("ANTHROPIC_API_KEY")
         self.pi = env.get("UNIICHAT_PI") or "pi"
         if real and not self.key and want in ("auto", "api"):
-            self.key = pi_api_key(self.pi, provider)
+            self.key = pi_api_key(self.pi, PROVIDER)
         self.timeout = int(env.get("UNIICHAT_TIMEOUT") or 300)
-        self.api_url = (env.get(spec["url_env"]) or spec["url"]).rstrip("/")
+        self.api_url = (env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
         self.backend = ("api" if self.key else "pi") if want == "auto" else want
         if self.backend == "api" and not self.key:
-            raise Die("UNIICHAT_BACKEND=api needs %s." % spec["key"])
+            raise Die("UNIICHAT_BACKEND=api needs ANTHROPIC_API_KEY.")
 
 
 class ApiBackend:
@@ -819,79 +799,6 @@ class ApiConversation:
         pass
 
 
-class DeepSeekBackend:
-    """DeepSeek's chat API (direct, OpenAI format). The request is the system
-    prompt, then the view and the task as one user message, so the prefix
-    stays the same from call to call and DeepSeek caches it by itself. No
-    cache marks: this API has none."""
-
-    def __init__(self, cfg, opener=urllib.request.urlopen):
-        self.cfg, self.opener = cfg, opener
-
-    def conversation(self, system, chat_lines, task):
-        return DeepSeekConversation(self, system, chat_lines, task)
-
-
-class DeepSeekConversation:
-    def __init__(self, backend, system, chat_lines, task):
-        self.b = backend
-        self.messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": "".join(
-                b["text"] for b in render_blocks(chat_lines, task))}]
-        self.usage = {"hit": 0, "miss": 0, "out": 0, "calls": 0}
-
-    def _post(self, thinking_on):
-        cfg = self.b.cfg
-        body = {"model": cfg.model, "messages": self.messages}
-        if thinking_on:
-            level = cfg.thinking if cfg.thinking in THINKING else "high"
-            body["thinking"] = {"type": "enabled"}
-            body["reasoning_effort"] = ("max" if level in ("xhigh", "max")
-                                        else "high")
-            body["max_tokens"] = DEEPSEEK_LINE_TOKENS + THINKING[level]
-        else:
-            body["thinking"] = {"type": "disabled"}
-            body["max_tokens"] = DEEPSEEK_LINE_TOKENS
-        req = urllib.request.Request(
-            cfg.api_url + "/chat/completions", json.dumps(body).encode(),
-            {"content-type": "application/json",
-             "authorization": "Bearer " + cfg.key})
-        try:
-            with self.b.opener(req, timeout=cfg.timeout) as r:
-                data = json.load(r)
-            choice = data["choices"][0]
-            text = choice["message"].get("content") or ""
-        except (urllib.error.URLError, OSError, ValueError, KeyError,
-                IndexError, TypeError) as e:
-            raise ModelError("API call failed: %s" % e)
-        u = data.get("usage") or {}
-        self.usage["hit"] += u.get("prompt_cache_hit_tokens", 0)
-        self.usage["miss"] += u.get("prompt_cache_miss_tokens", 0)
-        self.usage["out"] += u.get("completion_tokens", 0)
-        self.usage["calls"] += 1
-        return text.strip()
-
-    def _send(self, first):
-        mode = self.b.cfg.thinking
-        on = mode != "off" and (mode != "cut" or not first)
-        text = self._post(on)
-        if not text and on:  # thinking used every token: ask again without it
-            text = self._post(False)
-        self.messages.append({"role": "assistant", "content": text})
-        return text
-
-    def ask(self):
-        return self._send(True)
-
-    def followup(self, user):
-        self.messages.append({"role": "user", "content": user})
-        return self._send(False)
-
-    def close(self):
-        pass
-
-
 class PiBackend:
     """The same call through `pi --no-extensions -p`: no cache marks."""
 
@@ -911,13 +818,10 @@ class PiConversation:
 
     def _run(self, text):
         c = self.cfg
-        thinking = c.thinking  # cut: think only to cut a line that was too long
-        if thinking == "cut":
-            thinking = "off" if self.first else "high"
         cmd = [c.pi, "--no-extensions", "--no-skills", "--no-context-files",
                "--no-tools", "--no-mcp", "--no-prompt-templates",
                "--no-themes", "--provider", c.provider, "--model", c.model,
-               "--thinking", thinking, "--session-dir", self.dir]
+               "--thinking", c.thinking, "--session-dir", self.dir]
         if not self.first:
             cmd.append("--continue")
         cmd += ["--system-prompt", self.system, "-p"]
@@ -951,8 +855,7 @@ def make_backend(cfg):
                   "set UNIICHAT_BACKEND=api or pi." % ME)
     if cfg.backend == "pi":
         return PiBackend(cfg)
-    return (DeepSeekBackend(cfg) if cfg.provider == "deepseek"
-            else ApiBackend(cfg))
+    return ApiBackend(cfg)
 
 
 def clean(reply):
