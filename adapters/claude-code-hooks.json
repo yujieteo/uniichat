@@ -6,8 +6,7 @@
           {
             "type": "command",
             "command": "memo capture claude",
-            "async": true,
-            "timeout": 30
+            "timeout": 10
           }
         ]
       }

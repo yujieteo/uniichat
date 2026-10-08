@@ -1,4 +1,5 @@
-// UniiChat capture for Pi: after each turn, tell `memo capture pi` which
+// UniiChat capture for Pi (optional; off unless installed). At the start of a
+// run, after each turn and at shutdown it tells `memo capture pi` which
 // session file to read. memo reads what is new, redacts secrets and appends
 // the messages. This file never reads or writes the chat itself.
 //
@@ -58,6 +59,7 @@ export default function (pi: any) {
     }
   }
 
+  pi.on("agent_start", async (_event: any, ctx: any) => send(ctx));
   pi.on("turn_end", async (_event: any, ctx: any) => send(ctx));
   pi.on("agent_settled", async (_event: any, ctx: any) => send(ctx));
   pi.on("session_shutdown", async (_event: any, ctx: any) => send(ctx));

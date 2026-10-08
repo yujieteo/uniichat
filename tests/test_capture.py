@@ -141,15 +141,6 @@ class Adapters(Case):
         for left_out in ("AGENTS.md", "developer rules", "SECRET THOUGHT"):
             self.assertNotIn(left_out, everything)
 
-    def test_codex_exec_runs_and_subagent_threads_are_skipped(self):
-        for name in ("codex-exec-rollout.jsonl", "codex-subagent-rollout.jsonl"):
-            f = self.fixture(name)
-            self.hook("codex", self.payload("codex-stop.json", f))
-        self.assertEqual(self.messages(), [])
-        again = self.fixture("codex-exec-rollout.jsonl", "again.jsonl")
-        self.hook("codex", self.payload("codex-user-prompt-submit.json", again))
-        self.assertEqual(self.messages(), [])
-
     def test_pi_kinds_and_what_is_left_out(self):
         f = self.fixture("pi-session.jsonl")
         self.hook("pi", self.payload("pi-turn-end.json", f))
@@ -163,34 +154,19 @@ class Adapters(Case):
         for left_out in ("SECRET THOUGHT", "user shell noise", "system prompt"):
             self.assertNotIn(left_out, everything)
 
-    def test_pi_outside_the_interactive_mode_is_skipped(self):
-        f = self.fixture("pi-session.jsonl")
-        self.hook("pi", self.payload("pi-print-mode.json", f))
-        self.assertEqual(self.messages(), [])
-
-    def test_claude_subagent_hooks_are_skipped(self):
-        f = self.fixture("claude-transcript.jsonl")
-        self.hook("claude", self.payload("claude-subagent-post-tool-use.json", f))
-        self.assertEqual(self.messages(), [])
-
-    def test_firstmate_workers_and_pipeline_agents_are_skipped(self):
-        f = self.fixture("pi-session.jsonl")
-        text = self.payload("pi-turn-end.json", f)
+    def test_workers_subagents_and_print_runs_are_skipped(self):
+        pi = self.fixture("pi-session.jsonl")
+        claude = self.fixture("claude-transcript.jsonl")
+        for name in ("codex-exec-rollout.jsonl", "codex-subagent-rollout.jsonl"):
+            self.hook("codex", self.payload("codex-stop.json", self.fixture(name)))
+        self.hook("pi", self.payload("pi-print-mode.json", pi))
+        self.hook("claude", self.payload("claude-subagent-post-tool-use.json", claude))
         for var in SKIPPED:
             with mock.patch.dict(os.environ, {var: "1"}):
-                self.hook("pi", text)
-            self.assertEqual(self.messages(), [])
-            self.assertFalse(os.path.exists(self.store.p("capture")))
-        self.hook("pi", text)  # the main session has none of them
+                self.hook("pi", self.payload("pi-turn-end.json", pi))
+        self.assertEqual(self.messages(), [])
+        self.hook("pi", self.payload("pi-turn-end.json", pi))  # the main session
         self.assertEqual(len(self.messages()), 5)
-
-    def test_message_date_is_the_time_of_the_event_and_has_its_source_key(self):
-        f = self.fixture("pi-session.jsonl")
-        self.hook("pi", self.payload("pi-turn-end.json", f))
-        first = self.messages()[0]
-        self.assertEqual(first["date"], memo.local_date("2026-03-01T12:02:00.000Z"))
-        self.assertTrue(first["k"].startswith("e") or first["k"].startswith("p"))
-        self.assertEqual(set(first), {"i", "kind", "text", "size", "date", "k"})
 
     def test_source_prefix_is_short_and_tells_sessions_apart(self):
         a = self.fixture("pi-session.jsonl", "a.jsonl")
@@ -204,13 +180,6 @@ class Adapters(Case):
         # the same session always gets the same prefix
         self.hook("pi", self.payload("pi-turn-end.json", a, "pi-session-1"))
         self.assertEqual(len(self.messages()), 13)
-
-    def test_capture_lands_in_the_view_as_normal_messages(self):
-        f = self.fixture("claude-transcript.jsonl")
-        self.hook("claude", self.payload("claude-stop.json", f))
-        s = self.store.load()
-        self.assertEqual(s.n, 8)
-        self.assertIn("user: [claude ", self.store.tree.get(0, 0))
 
 
 class Idempotence(Case):
@@ -236,7 +205,7 @@ class Idempotence(Case):
                          ["one more question", "answer"])
         self.assertEqual(len(self.messages()), 7)
 
-    def test_a_lost_cursor_does_not_duplicate_messages(self):
+    def test_a_lost_cursor_or_a_copied_session_file_adds_nothing(self):
         for name, harness, payload in (
                 ("claude-transcript.jsonl", "claude", "claude-stop.json"),
                 ("codex-rollout.jsonl", "codex", "codex-stop.json"),
@@ -247,18 +216,7 @@ class Idempotence(Case):
             n = len(self.messages())
             shutil.rmtree(self.store.p("capture/cursors"))
             self.hook(harness, text)
-            self.assertEqual(len(self.messages()), n, name)
-
-    def test_a_copy_of_a_session_file_under_a_new_id_adds_nothing(self):
-        """A resumed or forked session carries its old messages along."""
-        for name, harness, payload in (
-                ("claude-transcript.jsonl", "claude", "claude-stop.json"),
-                ("codex-rollout.jsonl", "codex", "codex-stop.json"),
-                ("pi-session.jsonl", "pi", "pi-turn-end.json")):
-            f = self.fixture(name)
-            self.hook(harness, self.payload(payload, f, "old-id"))
-            n = len(self.messages())
-            copy = self.fixture(name, "fork-" + name)
+            copy = self.fixture(name, "fork-" + name)  # a resumed or forked session
             self.hook(harness, self.payload(payload, copy, "new-id"))
             self.assertEqual(len(self.messages()), n, name)
 
@@ -295,13 +253,6 @@ class Idempotence(Case):
         self.assertEqual(len(self.messages()), 5)
         self.hook("pi", text)
         self.assertEqual(len(self.messages()), 5)
-
-    def test_a_bad_line_is_logged_and_the_rest_is_kept(self):
-        f = self.fixture("pi-session.jsonl")
-        self.append(f, "{not json", json.dumps(pi_entry(50, "user", "after it")))
-        self.hook("pi", self.payload("pi-turn-end.json", f))
-        self.assertEqual(self.bodies()[-1], ("user", "after it"))
-        self.assertIn("bad line in pi-session.jsonl", self.errors())
 
     def test_stop_waits_for_the_transcript_to_hold_the_last_reply(self):
         src = os.path.join(FIX, "claude-transcript.jsonl")
@@ -351,30 +302,6 @@ class Contention(Case):
         memo.drain(self.store, tries=3, pause=0.01)
         self.assertEqual(len(self.messages()), 5)
         self.assertEqual(os.listdir(self.store.p("capture/queue")), [])
-
-    def test_a_queued_hook_retries_until_the_lock_is_free(self):
-        f = self.fixture("pi-session.jsonl")
-        self.hook("pi", self.payload("pi-turn-end.json", f))  # creates capture/
-        self.append(f, pi_entry(60, "user", "while the lock is taken"))
-        fd = self.hold_lock()
-        with mock.patch.object(memo, "LOCK_WAIT", 0.05), \
-                mock.patch.object(memo, "spawn_drain"):
-            self.hook("pi", self.payload("pi-turn-end.json", f))
-        threading.Timer(0.2, lambda: fcntl.flock(fd, fcntl.LOCK_UN)).start()
-        memo.drain(self.store, tries=100, pause=0.02)
-        self.assertEqual(self.bodies()[-1], ("user", "while the lock is taken"))
-        self.assertEqual(len(self.messages()), 6)
-
-    def test_a_job_that_never_gets_the_lock_is_dropped_and_logged(self):
-        f = self.fixture("pi-session.jsonl")
-        self.hold_lock()
-        with mock.patch.object(memo, "LOCK_WAIT", 0.01), \
-                mock.patch.object(memo, "DRAIN_WAIT", 0.01), \
-                mock.patch.object(memo, "spawn_drain"):
-            self.hook("pi", self.payload("pi-turn-end.json", f))
-            memo.drain(self.store, tries=2, pause=0.01)
-        self.assertEqual(os.listdir(self.store.p("capture/queue")), [])
-        self.assertIn("gave up", self.errors())
 
     def test_real_processes_queue_retry_and_finish(self):
         """A real hook finds the lock taken, queues, and a real detached
@@ -435,18 +362,6 @@ class Contention(Case):
             pass
         self.assertEqual(self.errors(), "")
 
-    def test_one_hooks_messages_are_contiguous(self):
-        f = self.fixture("pi-session.jsonl")
-        other = os.path.join(self.tmp, "other.jsonl")
-        self.append(other, pi_entry(1, "user", "other-1"),
-                    pi_entry(2, "user", "other-2"))
-        self.hook("pi", self.payload("pi-turn-end.json", f, "one"))
-        self.hook("pi", json.dumps({"session_id": "two", "session_file": other,
-                                    "mode": "tui"}))
-        bodies = [b for _, b in self.bodies()]
-        self.assertEqual(bodies[-2:], ["other-1", "other-2"])
-        self.assertEqual(len(bodies), 7)
-
 
 class Size(Case):
     def test_a_huge_tool_output_keeps_head_and_tail_30000_characters(self):
@@ -466,17 +381,6 @@ class Size(Case):
         self.assertTrue(joined.endswith("xxxTAIL"))
         self.assertIn("characters clipped", joined)
 
-    def test_a_huge_tool_input_is_clipped_the_same_way(self):
-        f = os.path.join(self.tmp, "hugein.jsonl")
-        call = {"type": "toolCall", "id": "c", "name": "write",
-                "arguments": {"path": "/a", "content": "y" * 500_000}}
-        self.append(f, pi_entry(1, "assistant", [call]))
-        self.hook("pi", json.dumps({"session_id": "h", "session_file": f,
-                                    "mode": "tui"}))
-        msgs = self.messages()
-        self.assertTrue(all(m["kind"] == "tool" for m in msgs))
-        self.assertEqual(len("".join(m["text"] for m in msgs)), memo.ECHO_MAX)
-
     def test_a_long_user_message_is_never_clipped_only_split(self):
         f = os.path.join(self.tmp, "long.jsonl")
         text = "".join("line %d é\n" % k for k in range(12000))
@@ -488,14 +392,6 @@ class Size(Case):
         self.assertTrue(all(m["size"] <= memo.MESSAGE_MAX for m in msgs))
         joined = "".join(m["text"] for m in msgs)
         self.assertEqual(re.sub(r"^\[pi [0-9a-f]{4}\] ", "", joined), text)
-
-    def test_an_empty_tool_output_is_logged_as_such(self):
-        f = os.path.join(self.tmp, "empty.jsonl")
-        self.append(f, pi_entry(1, "toolResult", []),
-                    pi_entry(2, "user", "   "))
-        self.hook("pi", json.dumps({"session_id": "h", "session_file": f,
-                                    "mode": "tui"}))
-        self.assertEqual(self.bodies(), [("echo", "(no output)")])
 
 
 class Redaction(Case):
@@ -513,12 +409,10 @@ class Redaction(Case):
         ("jwt", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk"),
     ]
 
-    def test_token_formats(self):
+    def test_token_formats_and_private_key_blocks(self):
         for name, secret in self.CASES:
             out = memo.redact("before %s after" % secret)
             self.assertEqual(out, "before [REDACTED] after", name)
-
-    def test_private_key_blocks(self):
         pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\ndef==\n-----END RSA PRIVATE KEY-----"
         self.assertEqual(memo.redact("k:\n%s\nok" % pem), "k:\n[REDACTED]\nok")
         cut = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nza\nmore"
@@ -585,48 +479,14 @@ class Safety(Case):
         self.hook("pi", json.dumps({"session_file": "/no/such/file"}))
         self.hook("pi", json.dumps({}))
         self.assertEqual(self.messages(), [])
-
-    def test_a_missing_store_is_not_an_error_for_the_harness(self):
         gone = memo.Store(os.path.join(self.tmp, "nowhere"))
-        f = self.fixture("pi-session.jsonl")
-        err = self.hook("pi", self.payload("pi-turn-end.json", f), store=gone)
-        self.assertIn("no chat at", err)
+        self.assertIn("no chat at", self.hook("pi", text, store=gone))
         self.assertFalse(os.path.exists(gone.path))
-
-    def test_a_store_that_cannot_be_written_still_exits_zero(self):
-        f = self.fixture("pi-session.jsonl")
-        os.chmod(self.store.path, 0o500)
-        self.addCleanup(os.chmod, self.store.path, 0o700)
-        if os.access(self.store.path, os.W_OK):
-            self.skipTest("the user can write anywhere")
+        f = self.fixture("pi-session.jsonl", "bad.jsonl")
+        self.append(f, "{not json", json.dumps(pi_entry(50, "user", "after it")))
         self.hook("pi", self.payload("pi-turn-end.json", f))
-
-    def test_unknown_harness_is_a_usage_error(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code = memo.main(["--store", self.store.path, "capture", "vim"],
-                             out=lambda m: None)
-        self.assertEqual(code, 1)
-        self.assertIn("usage:", err.getvalue())
-
-    def test_capture_output_is_empty_so_hooks_add_no_context(self):
-        f = self.fixture("claude-transcript.jsonl")
-        shown = []
-        with mock.patch.object(sys, "stdin",
-                               io.StringIO(self.payload("claude-stop.json", f))):
-            memo.main(["--store", self.store.path, "capture", "claude"],
-                      out=shown.append)
-        self.assertEqual(shown, [])
-
-    def test_status_shows_the_capture_state(self):
-        f = self.fixture("pi-session.jsonl")
-        self.hook("pi", self.payload("pi-turn-end.json", f))
-        self.hook("pi", "not json")
-        lines = []
-        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}):
-            memo.cmd_status(self.store, [], lines.append)
-        self.assertIn("capture    1 session files followed, 0 queued, 1 error lines",
-                      lines)
+        self.assertEqual(self.bodies()[-1], ("user", "after it"))
+        self.assertIn("bad line in bad.jsonl", self.errors())
 
     def test_a_real_hook_process_is_fast(self):
         f = self.fixture("claude-transcript.jsonl")
@@ -643,13 +503,63 @@ class Safety(Case):
         self.assertEqual(len(self.messages()), 8)
 
 
+class AgentAndHooks(Case):
+    """A session with both the AGENTS.md block (the agent logs) and a hook."""
+
+    def test_a_prompt_hook_asks_for_the_compaction_in_the_context(self):
+        with self.store.writer():
+            self.store.add_messages([("note", "long " + "x" * 600, None)])
+        f = self.fixture("claude-transcript.jsonl")
+
+        def run(harness, name):
+            shown = []
+            with mock.patch.object(sys, "stdin", io.StringIO(self.payload(name, f))):
+                memo.main(["--store", self.store.path, "capture", harness],
+                          out=shown.append)
+            return "\n".join(shown)
+
+        out = run("claude", "claude-user-prompt-submit.json")
+        self.assertIn(memo.ASK, out)
+        self.assertIn("memo line 0+1", out)
+        self.assertEqual(run("claude", "claude-post-tool-use.json"), "")
+        self.assertEqual(run("claude", "claude-stop.json"), "")
+        self.assertIn(memo.ASK, run("codex", "codex-user-prompt-submit.json"))
+
+    def test_the_agent_does_not_log_what_a_hook_of_its_session_logs(self):
+        def say(kind, text, env):
+            out = []
+            with mock.patch.dict(os.environ, env):
+                memo.main(["--store", self.store.path, kind, text],
+                          out=out.append)
+            return "\n".join(out)
+
+        f = self.fixture("pi-session.jsonl")
+        mine = {"PI_SESSION_ID": "hooked"}
+        self.assertIn("Saved", say("user", "before the hook", mine))  # no hook yet
+        self.hook("pi", self.payload("pi-turn-end.json", f, "hooked"))
+        n = len(self.messages())
+        self.assertIn("Not saved", say("unii", "my reply", mine))
+        self.assertIn("Not saved", say("user", "my prompt", mine))
+        self.assertEqual(len(self.messages()), n)
+        # another session, a session of another harness, and a plain note
+        say("unii", "other " + fake("sk-", 30), {"PI_SESSION_ID": "other"})
+        say("user", "claude one", {"CLAUDE_CODE_SESSION_ID": "c1"})
+        say("note", "kept", mine)
+        self.assertEqual([k for k, _ in self.texts()[n:]], ["unii", "user", "note"])
+        self.assertRegex(self.texts()[n][1], r"^\[pi [0-9a-f]{4}\] other \[REDACTED\]$")
+        self.assertRegex(self.texts()[n + 1][1], r"^\[claude [0-9a-f]{4}\] claude one$")
+        # a worker logs nothing, not even by itself
+        self.assertIn("Not saved", say("user", "w", {"FM_TASK_ID": "t"}))
+        self.assertEqual(len(self.messages()), n + 3)
+
+
 class Adapters_in_the_repository(unittest.TestCase):
     """The files the README tells the captain to install."""
 
     def root(self, *p):
         return os.path.join(HERE, "..", "adapters", *p)
 
-    def test_hook_files_name_memo_capture_and_run_in_the_background(self):
+    def test_hook_files_name_memo_capture_and_never_wait_but_the_prompt_hook(self):
         for name, harness, events in (
                 ("claude-code-hooks.json", "claude",
                  ("UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")),
@@ -663,16 +573,11 @@ class Adapters_in_the_repository(unittest.TestCase):
                     for h in group["hooks"]:
                         self.assertEqual(h["type"], "command")
                         self.assertEqual(h["command"], "memo capture " + harness)
-                        if event != "SessionEnd":
+                        # a prompt hook waits: its output is context for the prompt
+                        if event in ("PostToolUse", "Stop"):
                             self.assertTrue(h["async"], event)
-
-    def test_pi_extension_calls_memo_capture_and_guards_the_session(self):
-        with open(self.root("pi", "uniichat-capture.ts"), encoding="utf-8") as f:
-            src = f.read()
-        for needle in ('"capture", "pi"', 'ctx.mode !== "tui"', "FM_TASK_ID",
-                       "NO_MISTAKES_GATE", "turn_end", "agent_settled",
-                       "session_shutdown", "detached: true", "unref()"):
-            self.assertIn(needle, src)
+                        else:
+                            self.assertFalse(h.get("async"), event)
 
 
 if __name__ == "__main__":

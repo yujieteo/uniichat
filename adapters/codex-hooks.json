@@ -6,8 +6,7 @@
           {
             "type": "command",
             "command": "memo capture codex",
-            "async": true,
-            "timeout": 30
+            "timeout": 10
           }
         ]
       }
