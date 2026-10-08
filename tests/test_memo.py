@@ -768,9 +768,10 @@ class Backends(unittest.TestCase):
                 {"type": "text", "text": "x" * 600 if len(sent) == 1
                  else "short"}]}).encode())
 
-        cfg = memo.Config({"ANTHROPIC_API_KEY": "test-key"})
-        self.assertEqual((cfg.backend, cfg.model),
-                         ("api", "claude-haiku-4-5-20251001"))
+        cfg = memo.Config({"UNIICHAT_MODEL": "claude-haiku-4-5-20251001",
+                           "ANTHROPIC_API_KEY": "test-key"})
+        self.assertEqual((cfg.backend, cfg.model, cfg.provider),
+                         ("api", "claude-haiku-4-5-20251001", "anthropic"))
         conv = memo.ApiBackend(cfg, opener).conversation(
             "SYS", ["%d+1|line %d" % (k, k) for k in range(10)], "TASK")
         self.assertEqual(conv.ask(), "x" * 600)
@@ -801,22 +802,42 @@ class Backends(unittest.TestCase):
         blocks = memo.render_blocks([], "T")
         self.assertEqual(blocks[0]["text"], "<chat>\n</chat>\nT")
 
+    def test_default_model_is_deepseek_flash_and_haiku_stays_selectable(self):
+        cfg = memo.Config({"DEEPSEEK_API_KEY": "k"})
+        self.assertEqual((cfg.provider, cfg.model, cfg.backend, cfg.thinking),
+                         ("deepseek", "deepseek-flash", "api", "cut"))
+        self.assertEqual(cfg.api_url, "https://api.deepseek.com")
+        self.assertIsInstance(memo.make_backend(cfg), memo.DeepSeekBackend)
+        haiku = memo.Config({"UNIICHAT_MODEL": "claude-haiku-4-5-20251001",
+                             "ANTHROPIC_API_KEY": "k"})
+        self.assertEqual((haiku.provider, haiku.thinking), ("anthropic", "xhigh"))
+        self.assertIsInstance(memo.make_backend(haiku), memo.ApiBackend)
+        by_name = memo.Config({"UNIICHAT_PROVIDER": "anthropic",
+                               "ANTHROPIC_API_KEY": "k"})
+        self.assertEqual(by_name.model, "claude-haiku-4-5-20251001")
+        with self.assertRaises(memo.Die):
+            memo.Config({"UNIICHAT_PROVIDER": "openrouter"})
+        with self.assertRaises(memo.Die):
+            memo.Config({"UNIICHAT_THINKING": "cut",
+                         "UNIICHAT_PROVIDER": "anthropic"})
+
     def test_backend_choice(self):
         self.assertEqual(memo.Config({}).backend, "pi")
-        self.assertEqual(memo.Config({"ANTHROPIC_API_KEY": "k"}).backend, "api")
-        self.assertEqual(memo.Config({"ANTHROPIC_API_KEY": "k",
+        self.assertEqual(memo.Config({"DEEPSEEK_API_KEY": "k"}).backend, "api")
+        self.assertEqual(memo.Config({"ANTHROPIC_API_KEY": "k"}).backend, "pi")
+        self.assertEqual(memo.Config({"DEEPSEEK_API_KEY": "k",
                                       "UNIICHAT_BACKEND": "pi"}).backend, "pi")
         with self.assertRaises(memo.Die):
             memo.Config({"UNIICHAT_BACKEND": "api"})
 
-    def test_key_comes_from_pi_once_when_the_env_has_none(self):
+    def test_key_comes_from_pi_once_per_provider_when_the_env_has_none(self):
         calls = []
 
         def run(cmd, **kw):
             calls.append(cmd)
             return mock.Mock(returncode=0, stdout="sk-test-123\n", stderr="")
 
-        with mock.patch.object(memo, "_pi_key", []), \
+        with mock.patch.object(memo, "_pi_key", {}), \
                 mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(memo.subprocess, "run", run):
             a, b = memo.Config(), memo.Config()
@@ -824,20 +845,20 @@ class Backends(unittest.TestCase):
                          ("api", "sk-test-123", "sk-test-123"))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1:], ["auth", "print-api-key", "--provider",
-                                        "anthropic"])
+                                        "deepseek"])
 
     def test_env_key_wins_and_no_key_falls_back_to_the_pi_cli(self):
         with mock.patch.object(memo.subprocess, "run") as run, \
-                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-env"}):
+                mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-env"}):
             self.assertEqual(memo.Config().key, "sk-env")
             run.assert_not_called()
         fail = mock.Mock(returncode=1, stdout="", stderr="no key")
-        with mock.patch.object(memo, "_pi_key", []), \
+        with mock.patch.object(memo, "_pi_key", {}), \
                 mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(memo.subprocess, "run", return_value=fail):
             cfg = memo.Config()
         self.assertEqual((cfg.backend, cfg.key), ("pi", None))
-        with mock.patch.object(memo, "_pi_key", []), \
+        with mock.patch.object(memo, "_pi_key", {}), \
                 mock.patch.dict(os.environ, {"UNIICHAT_BACKEND": "pi"},
                                 clear=True), \
                 mock.patch.object(memo.subprocess, "run") as run:
@@ -859,12 +880,158 @@ class Backends(unittest.TestCase):
             conv.close()
         first, second = calls
         self.assertIn("--no-extensions", first[0])
-        self.assertIn("claude-haiku-4-5-20251001", first[0])
-        self.assertIn("xhigh", first[0])
+        self.assertEqual(first[0][first[0].index("--provider") + 1], "deepseek")
+        self.assertEqual(first[0][first[0].index("--model") + 1], "deepseek-flash")
+        self.assertEqual(first[0][first[0].index("--thinking") + 1], "off")
+        self.assertEqual(second[0][second[0].index("--thinking") + 1], "high")
         self.assertNotIn("--continue", first[0])
         self.assertIn("--continue", second[0])
         self.assertEqual(first[1]["input"], "<chat>\n0+1|a\n</chat>\nTASK")
         self.assertEqual(second[1]["input"], "again")
+
+    def test_pi_command_line_for_haiku(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append(cmd)
+            return mock.Mock(returncode=0, stdout="ok\n", stderr="")
+
+        cfg = memo.Config({"UNIICHAT_MODEL": "claude-haiku-4-5-20251001"})
+        with mock.patch.object(memo.subprocess, "run", run):
+            memo.PiBackend(cfg).conversation("S", [], "T").ask()
+        cmd = seen[0]
+        self.assertEqual(cmd[cmd.index("--provider") + 1], "anthropic")
+        self.assertEqual(cmd[cmd.index("--thinking") + 1], "xhigh")
+
+
+class Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+
+class DeepSeek(unittest.TestCase):
+    def setUp(self):
+        self.sent = []
+        self.replies = []
+
+    def opener(self, req, timeout=None):
+        self.sent.append((req, json.loads(req.data)))
+        content, finish = self.replies.pop(0)
+        return Resp(json.dumps({"choices": [{"finish_reason": finish, "message": {
+            "role": "assistant", "content": content,
+            "reasoning_content": "hm"}}],
+            "usage": {"prompt_cache_hit_tokens": 40, "prompt_cache_miss_tokens": 10,
+                      "completion_tokens": 7}}).encode())
+
+    def conv(self, thinking=None, lines=("0+1|a", "1+1|b")):
+        env = {"DEEPSEEK_API_KEY": "test-key"}
+        if thinking:
+            env["UNIICHAT_THINKING"] = thinking
+        cfg = memo.Config(env)
+        return memo.DeepSeekBackend(cfg, self.opener).conversation(
+            "SYS", list(lines), "TASK")
+
+    def test_request_is_the_direct_chat_api_without_cache_marks(self):
+        self.replies = [("one line", "stop")]
+        conv = self.conv()
+        self.assertEqual(conv.ask(), "one line")
+        req, body = self.sent[0]
+        self.assertEqual(req.full_url, "https://api.deepseek.com/chat/completions")
+        self.assertEqual(req.get_header("Authorization"), "Bearer test-key")
+        self.assertEqual(body["model"], "deepseek-flash")
+        self.assertEqual(body["messages"], [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "<chat>\n0+1|a\n1+1|b\n</chat>\nTASK"}])
+        self.assertNotIn("cache_control", json.dumps(body))
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertEqual(body["max_tokens"], 1024)
+        self.assertEqual(conv.usage, {"hit": 40, "miss": 10, "out": 7, "calls": 1})
+
+    def test_follow_up_keeps_the_same_prefix_and_thinks_to_cut(self):
+        self.replies = [("x" * 600, "stop"), ("short", "stop")]
+        conv = self.conv()
+        conv.ask()
+        self.assertEqual(conv.followup("cut"), "short")
+        first, second = self.sent[0][1], self.sent[1][1]
+        self.assertEqual(second["messages"][:2], first["messages"][:2])
+        self.assertEqual([m["role"] for m in second["messages"]],
+                         ["system", "user", "assistant", "user"])
+        self.assertEqual(second["thinking"], {"type": "enabled"})
+        self.assertEqual(second["reasoning_effort"], "high")
+        self.assertGreater(second["max_tokens"], 8000)
+        self.assertNotIn("reasoning_content", json.dumps(second["messages"]))
+
+    def test_thinking_settings(self):
+        self.replies = [("a", "stop")] * 3
+        for mode, first_thinks in (("off", False), ("high", True), ("max", True)):
+            self.sent.clear()
+            self.conv(mode).ask()
+            body = self.sent[0][1]
+            self.assertEqual(body["thinking"]["type"],
+                             "enabled" if first_thinks else "disabled")
+            if mode == "max":
+                self.assertEqual(body["reasoning_effort"], "max")
+                self.assertEqual(body["max_tokens"], 1024 + 32000)
+        self.sent.clear()
+        self.replies = [("a", "stop")]
+        conv = self.conv("off")
+        conv.ask()
+        self.replies = [("b", "stop")]
+        conv.followup("cut")
+        self.assertEqual(self.sent[1][1]["thinking"], {"type": "disabled"})
+
+    def test_a_line_comes_back_when_thinking_used_every_token(self):
+        self.replies = [("", "length"), ("the line", "stop")]
+        conv = self.conv("high")
+        self.assertEqual(conv.ask(), "the line")
+        self.assertEqual([b["thinking"]["type"] for _, b in self.sent],
+                         ["enabled", "disabled"])
+        self.assertEqual(conv.messages[-1], {"role": "assistant",
+                                             "content": "the line"})
+
+    def test_an_empty_reply_without_thinking_is_an_error_the_node_retries(self):
+        self.replies = [("", "stop")] * memo.TRIES
+        job = {"chat": [], "task": "T"}
+        backend = mock.Mock()
+        backend.conversation.return_value = self.conv()
+        with self.assertRaises(memo.ModelError):
+            memo.run_job(backend, job)
+
+    def test_http_and_json_errors_are_model_errors(self):
+        def broken(req, timeout=None):
+            raise memo.urllib.error.URLError("down")
+
+        cfg = memo.Config({"DEEPSEEK_API_KEY": "k"})
+        conv = memo.DeepSeekBackend(cfg, broken).conversation("S", [], "T")
+        with self.assertRaises(memo.ModelError):
+            conv.ask()
+        self.opener = lambda req, timeout=None: Resp(b'{"error": "x"}')
+        with self.assertRaises(memo.ModelError):
+            self.conv().ask()
+
+    def test_the_ruler_cut_and_five_tries_hold_for_deepseek(self):
+        self.replies = [("x" * 600, "stop")] * memo.TRIES
+        backend = memo.DeepSeekBackend(memo.Config({"DEEPSEEK_API_KEY": "k"}),
+                                       self.opener)
+        line = memo.run_job(backend, {"chat": ["0+1|a"], "task": "T"})
+        self.assertEqual(len(self.sent), memo.TRIES)
+        self.assertEqual(memo.nbytes(line), 600)  # the shortest it ever gave
+        last = self.sent[-1][1]["messages"][-1]["content"]
+        self.assertTrue(last.startswith("Too long: your line is 600 bytes"))
+
+    def test_status_names_the_model(self):
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}):
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, tmp, True)
+            store = memo.Store(os.path.join(tmp, "c"))
+            store.init()
+            lines = []
+            memo.cmd_status(store, [], lines.append)
+        self.assertIn("deepseek-flash (deepseek) via api, thinking cut",
+                      "\n".join(lines))
 
 
 class Timed(unittest.TextTestResult):

@@ -1,0 +1,11 @@
+{
+  "session_id": "@SID@",
+  "transcript_path": "@FILE@",
+  "cwd": "/work/app",
+  "hook_event_name": "PostToolUse",
+  "agent_id": "agent-1",
+  "agent_type": "Explore",
+  "tool_name": "Read",
+  "tool_input": {},
+  "tool_use_id": "toolu_9"
+}

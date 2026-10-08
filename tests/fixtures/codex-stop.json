@@ -1,0 +1,10 @@
+{
+  "session_id": "@SID@",
+  "transcript_path": "@FILE@",
+  "cwd": "/work/app",
+  "hook_event_name": "Stop",
+  "model": "gpt-test",
+  "turn_id": "t1",
+  "stop_hook_active": false,
+  "last_assistant_message": "Renamed helper to upload_file in 1 file."
+}

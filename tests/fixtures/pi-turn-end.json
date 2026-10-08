@@ -1,0 +1,5 @@
+{
+  "session_id": "@SID@",
+  "session_file": "@FILE@",
+  "mode": "tui"
+}

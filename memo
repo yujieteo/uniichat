@@ -9,6 +9,8 @@
   memo compact                   build the pending summaries now
   memo status                    sizes, queues and model
   memo import [LOG.txt]          append old OptMem memories as notes
+  memo capture HARNESS           log new messages of a claude|codex|pi session
+                                 (a hook payload on stdin; see README)
 
 Global option, before the command: --store PATH. The store is PATH, else
 $UNIICHAT_DIR, else ~/.uniichat/chat. Kinds: user unii tool echo work note.
@@ -19,6 +21,7 @@ import bisect
 import concurrent.futures
 import datetime
 import fcntl
+import hashlib
 import heapq
 import json
 import os
@@ -48,7 +51,6 @@ MESSAGE_MAX = 16000  # bytes of one message; longer text is split in several
 WAKE_PART = 20000  # bytes one `wake` call prints
 PLACEHOLDER = "(not summarized yet: zoom it)"
 RULER = "-" * NODE_MAX
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
 SYSTEM_PROMPT = """\
 You are OptMem, an AI agent that works for one user in a single chat that never
@@ -147,6 +149,10 @@ class Die(Exception):
 
 class ModelError(Exception):
     pass
+
+
+class Busy(Exception):
+    """The writer lock stayed taken for the whole wait."""
 
 
 def nbytes(s):
@@ -259,12 +265,15 @@ class Main:
         return self._file(i)[1]
 
     def append(self, items, clock):
-        """items = [(kind, text, date or None)]; returns the first id."""
+        """items = [(kind, text, date or None[, source key])]; returns the
+        first id. The key marks a captured message: field "k"."""
         base = self.count()
         recs = []
-        for k, (kind, text, date) in enumerate(items):
+        for k, (kind, text, date, *src) in enumerate(items):
             recs.append({"i": base + k, "kind": kind, "text": text,
                          "size": nbytes(text), "date": date or clock()})
+            if src:
+                recs[-1]["k"] = src[0]
         by_file = {}
         for r in recs:
             day = r["date"][:10]
@@ -426,10 +435,23 @@ class Store:
             os.makedirs(self.p(d), exist_ok=True)
 
     @contextmanager
-    def writer(self):
-        """The one writer lock. Every change to the store happens inside."""
+    def writer(self, timeout=None):
+        """The one writer lock. Every change to the store happens inside.
+        With a timeout (seconds) it raises Busy instead of waiting longer."""
         lock = open(self.p(".lock"), "a")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            end = time.time() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() >= end:
+                        lock.close()
+                        raise Busy()
+                    time.sleep(0.02)
         try:
             yield
         finally:
@@ -649,49 +671,75 @@ def render_blocks(chat_lines, task):
 THINKING = {"off": 0, "minimal": 1024, "low": 2048, "medium": 4096,
             "high": 8192, "xhigh": 16000, "max": 32000}
 
+# The compaction model. DeepSeek v4 Flash (direct API) is the default.
+PROVIDERS = {
+    "deepseek": {"model": "deepseek-flash", "thinking": "cut",
+                 "key": "DEEPSEEK_API_KEY", "url": "https://api.deepseek.com",
+                 "url_env": "DEEPSEEK_BASE_URL"},
+    "anthropic": {"model": "claude-haiku-4-5-20251001", "thinking": "xhigh",
+                  "key": "ANTHROPIC_API_KEY", "url": "https://api.anthropic.com",
+                  "url_env": "ANTHROPIC_BASE_URL"},
+}
+DEEPSEEK_LINE_TOKENS = 1024  # max_tokens for the line, with no thinking
+# UNIICHAT_THINKING for DeepSeek: off (never think), cut (the default: no
+# thinking for the first line, thinking when the model must cut a line that
+# was too long), or a level (think on every call, as the Anthropic path does).
 
-_pi_key = []
+_pi_key = {}
 
 
-def pi_api_key(pi="pi"):
-    """The Anthropic key that pi stores, asked once per process and kept
-    in memory only. None if pi has no key."""
-    if not _pi_key:
+def pi_api_key(pi="pi", provider="anthropic"):
+    """The key that pi stores for a provider, asked once per process and
+    kept in memory only. None if pi has no key."""
+    if provider not in _pi_key:
         key = None
         try:
             r = subprocess.run([pi, "auth", "print-api-key", "--provider",
-                                "anthropic"], capture_output=True, text=True,
+                                provider], capture_output=True, text=True,
                                timeout=30)
             out = r.stdout.strip()
             if r.returncode == 0 and out and len(out.split()) == 1:
                 key = out
         except (OSError, subprocess.TimeoutExpired):
             pass
-        _pi_key.append(key)
-    return _pi_key[0]
+        _pi_key[provider] = key
+    return _pi_key[provider]
 
 
 class Config:
     def __init__(self, env=None):
         """env=None reads the real environment, and asks pi for a key when
-        ANTHROPIC_API_KEY is unset. A given dict is used as it is."""
+        the provider's key variable is unset. A given dict is used as it is.
+        The provider is UNIICHAT_PROVIDER, else the one the UNIICHAT_MODEL
+        name belongs to (claude...), else deepseek."""
         real = env is None
         env = os.environ if real else env
-        self.model = env.get("UNIICHAT_MODEL") or DEFAULT_MODEL
-        self.thinking = env.get("UNIICHAT_THINKING") or "xhigh"
-        self.key = env.get("ANTHROPIC_API_KEY")
+        model = env.get("UNIICHAT_MODEL")
+        provider = env.get("UNIICHAT_PROVIDER") or (
+            "anthropic" if model and model.startswith("claude") else "deepseek")
+        if provider not in PROVIDERS:
+            raise Die("UNIICHAT_PROVIDER is deepseek or anthropic, not %s."
+                      % provider)
+        spec = PROVIDERS[provider]
+        self.provider = provider
+        self.model = model or spec["model"]
+        self.thinking = env.get("UNIICHAT_THINKING") or spec["thinking"]
+        if self.thinking not in THINKING and not (
+                provider == "deepseek" and self.thinking == "cut"):
+            raise Die("UNIICHAT_THINKING is one of: %s%s." % (
+                " ".join(THINKING), " cut" if provider == "deepseek" else ""))
+        self.key = env.get(spec["key"])
         self.pi = env.get("UNIICHAT_PI") or "pi"
         if real and not self.key and env.get("UNIICHAT_BACKEND") != "pi":
-            self.key = pi_api_key(self.pi)
+            self.key = pi_api_key(self.pi, provider)
         self.timeout = int(env.get("UNIICHAT_TIMEOUT") or 300)
-        self.api_url = (env.get("ANTHROPIC_BASE_URL")
-                        or "https://api.anthropic.com").rstrip("/")
+        self.api_url = (env.get(spec["url_env"]) or spec["url"]).rstrip("/")
         want = env.get("UNIICHAT_BACKEND") or "auto"
         if want not in ("auto", "api", "pi"):
             raise Die("UNIICHAT_BACKEND is auto, api or pi, not %s." % want)
         self.backend = ("api" if self.key else "pi") if want == "auto" else want
         if self.backend == "api" and not self.key:
-            raise Die("UNIICHAT_BACKEND=api needs ANTHROPIC_API_KEY.")
+            raise Die("UNIICHAT_BACKEND=api needs %s." % spec["key"])
 
 
 class ApiBackend:
@@ -709,6 +757,7 @@ class ApiConversation:
         self.b, self.system = backend, system
         self.messages = [{"role": "user",
                           "content": render_blocks(chat_lines, task)}]
+        self.usage = {"hit": 0, "miss": 0, "out": 0, "calls": 0}
 
     def _send(self):
         cfg = self.b.cfg
@@ -728,6 +777,12 @@ class ApiConversation:
             raise ModelError("API call failed: %s" % e)
         text = "".join(c.get("text", "") for c in data.get("content", [])
                        if c.get("type") == "text")
+        u = data.get("usage") or {}
+        self.usage["hit"] += u.get("cache_read_input_tokens", 0)
+        self.usage["miss"] += (u.get("input_tokens", 0)
+                               + u.get("cache_creation_input_tokens", 0))
+        self.usage["out"] += u.get("output_tokens", 0)
+        self.usage["calls"] += 1
         self.messages.append({"role": "assistant", "content": text})
         return text
 
@@ -742,6 +797,79 @@ class ApiConversation:
             {"type": "text", "text": user,
              "cache_control": {"type": "ephemeral"}}]})
         return self._send()
+
+    def close(self):
+        pass
+
+
+class DeepSeekBackend:
+    """DeepSeek's chat API (direct, OpenAI format). The request is the system
+    prompt, then the view and the task as one user message, so the prefix
+    stays the same from call to call and DeepSeek caches it by itself. No
+    cache marks: this API has none."""
+
+    def __init__(self, cfg, opener=urllib.request.urlopen):
+        self.cfg, self.opener = cfg, opener
+
+    def conversation(self, system, chat_lines, task):
+        return DeepSeekConversation(self, system, chat_lines, task)
+
+
+class DeepSeekConversation:
+    def __init__(self, backend, system, chat_lines, task):
+        self.b = backend
+        self.messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "".join(
+                b["text"] for b in render_blocks(chat_lines, task))}]
+        self.usage = {"hit": 0, "miss": 0, "out": 0, "calls": 0}
+
+    def _post(self, thinking_on):
+        cfg = self.b.cfg
+        body = {"model": cfg.model, "messages": self.messages}
+        if thinking_on:
+            level = cfg.thinking if cfg.thinking in THINKING else "high"
+            body["thinking"] = {"type": "enabled"}
+            body["reasoning_effort"] = ("max" if level in ("xhigh", "max")
+                                        else "high")
+            body["max_tokens"] = DEEPSEEK_LINE_TOKENS + THINKING[level]
+        else:
+            body["thinking"] = {"type": "disabled"}
+            body["max_tokens"] = DEEPSEEK_LINE_TOKENS
+        req = urllib.request.Request(
+            cfg.api_url + "/chat/completions", json.dumps(body).encode(),
+            {"content-type": "application/json",
+             "authorization": "Bearer " + cfg.key})
+        try:
+            with self.b.opener(req, timeout=cfg.timeout) as r:
+                data = json.load(r)
+            choice = data["choices"][0]
+            text = choice["message"].get("content") or ""
+        except (urllib.error.URLError, OSError, ValueError, KeyError,
+                IndexError, TypeError) as e:
+            raise ModelError("API call failed: %s" % e)
+        u = data.get("usage") or {}
+        self.usage["hit"] += u.get("prompt_cache_hit_tokens", 0)
+        self.usage["miss"] += u.get("prompt_cache_miss_tokens", 0)
+        self.usage["out"] += u.get("completion_tokens", 0)
+        self.usage["calls"] += 1
+        return text.strip()
+
+    def _send(self, first):
+        mode = self.b.cfg.thinking
+        on = mode != "off" and (mode != "cut" or not first)
+        text = self._post(on)
+        if not text and on:  # thinking used every token: ask again without it
+            text = self._post(False)
+        self.messages.append({"role": "assistant", "content": text})
+        return text
+
+    def ask(self):
+        return self._send(True)
+
+    def followup(self, user):
+        self.messages.append({"role": "user", "content": user})
+        return self._send(False)
 
     def close(self):
         pass
@@ -766,10 +894,13 @@ class PiConversation:
 
     def _run(self, text):
         c = self.cfg
+        thinking = c.thinking  # cut: think only to cut a line that was too long
+        if thinking == "cut":
+            thinking = "off" if self.first else "high"
         cmd = [c.pi, "--no-extensions", "--no-skills", "--no-context-files",
                "--no-tools", "--no-mcp", "--no-prompt-templates",
-               "--no-themes", "--provider", "anthropic", "--model", c.model,
-               "--thinking", c.thinking, "--session-dir", self.dir]
+               "--no-themes", "--provider", c.provider, "--model", c.model,
+               "--thinking", thinking, "--session-dir", self.dir]
         if not self.first:
             cmd.append("--continue")
         cmd += ["--system-prompt", self.system, "-p"]
@@ -798,7 +929,10 @@ class PiConversation:
 
 
 def make_backend(cfg):
-    return ApiBackend(cfg) if cfg.backend == "api" else PiBackend(cfg)
+    if cfg.backend == "pi":
+        return PiBackend(cfg)
+    return (DeepSeekBackend(cfg) if cfg.provider == "deepseek"
+            else ApiBackend(cfg))
 
 
 def clean(reply):
@@ -896,6 +1030,468 @@ def compact(store, backend, log=lambda m: None, max_calls=MAX_CALLS,
     if failed:
         open(store.p(".worker-failed"), "w").close()
     return built, len(failed)
+
+
+# ------------------------------------------------------------ capture
+
+# Capture logs every message of a harness session (Claude Code, Codex, Pi)
+# as the design's kinds. A hook or an extension only says "this session file
+# changed": `memo capture HARNESS` reads what is new in that file.
+HARNESSES = ("claude", "codex", "pi")
+SKIP_ENV = ("FM_TASK_ID", "NO_MISTAKES_GATE")  # workers and pipeline agents
+LOCK_WAIT = 2.0  # seconds a hook waits for the writer lock before it queues
+DRAIN_WAIT = 0.2  # the same, for each try of the queue worker
+DRAIN_TRIES = 40  # a queued capture tries this often, 0.5 s apart
+READ_MAX = 8 << 20  # bytes of a session file read in one step
+SETTLE = 3.0  # seconds to wait for a transcript to hold the last reply
+ERROR_LOG_MAX = 256 << 10
+
+SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
+                r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.S),
+     "[REDACTED]"),
+    (re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"), "[REDACTED]"),
+    (re.compile(
+        r"\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}"
+        r"|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}"
+        r"|(?:AKIA|ASIA)[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}"
+        r"|AIza[0-9A-Za-z_-]{35}|npm_[A-Za-z0-9]{30,}"
+        r"|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"),
+     "[REDACTED]"),
+    (re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]{20,}", re.I), r"\1[REDACTED]"),
+    (re.compile(
+        r"(\b[A-Z0-9_.-]*(?:api[_-]?key|secret|token|passw(?:or)?d"
+        r"|private[_-]?key|access[_-]?key|credential)[A-Z0-9_.-]*[\"']?\s*[:=]"
+        r"\s*[\"']?)(?![$<{])[^\s\"',;]{8,}", re.I), r"\1[REDACTED]"),
+]
+
+
+def redact(text):
+    """Replace obvious secret values. The README lists exactly what."""
+    for rx, repl in SECRETS:
+        text = rx.sub(repl, text)
+    return text
+
+
+def sha(text, n=16):
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:n]
+
+
+def local_date(ts):
+    try:
+        d = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return d.astimezone().isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
+def blocks_text(content):
+    """The text of a string, a content block or a list of blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, str):
+            out.append(b)
+        elif isinstance(b, dict):
+            kind = str(b.get("type", "text")).lower()
+            if kind in ("text", "input_text", "output_text") \
+                    and isinstance(b.get("text"), str):
+                out.append(b["text"])
+            elif kind in ("image", "input_image"):
+                out.append("[image]")
+            elif isinstance(b.get("content"), (str, list)):
+                out.append(blocks_text(b["content"]))
+    return "\n".join(out)
+
+
+def tool_text(name, args):
+    """A tool call: its name and its JSON input."""
+    if not isinstance(args, str):
+        args = json.dumps(args if args is not None else {},
+                          ensure_ascii=False, separators=(",", ":"))
+    return "%s %s" % (name or "tool", args)
+
+
+def parse_claude(rec, raw):
+    """Messages of one Claude Code transcript line: [(kind, text, key, date)].
+    Skips the SDK and print-mode sessions and every subagent line."""
+    msg = rec.get("message")
+    uid = rec.get("uuid")
+    if (rec.get("isSidechain") or str(rec.get("entrypoint", "")).startswith("sdk")
+            or not uid or not isinstance(msg, dict)):
+        return []
+    kind, content, date = rec.get("type"), msg.get("content"), \
+        local_date(rec.get("timestamp"))
+    out = []
+    if kind == "user":
+        if rec.get("isMeta") or rec.get("isCompactSummary"):
+            return []
+        if isinstance(content, list):
+            for n, b in enumerate(x for x in content if isinstance(x, dict)
+                                  and x.get("type") == "tool_result"):
+                out.append(("echo", blocks_text(b.get("content")),
+                            "%s#%d" % (uid, n), date))
+            if out:
+                return out
+        text = blocks_text(content)
+        head = text.lstrip()
+        command = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+        if command:
+            args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+            text = (command.group(1).strip() + " "
+                    + (args.group(1).strip() if args else "")).strip()
+        if ((rec.get("promptSource") == "typed" or rec.get("turnOrigin") == "human"
+             or command)
+                and not head.startswith(("<local-command", "<task-notification",
+                                         "<system-reminder"))
+                and not head.startswith("This session is being continued")):
+            out.append(("user", text, uid, date))
+    elif kind == "assistant" and msg.get("model") != "<synthetic>":
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for n, b in enumerate(x for x in content or [] if isinstance(x, dict)):
+            if b.get("type") == "text":
+                out.append(("unii", b.get("text") or "", "%s#%d" % (uid, n), date))
+            elif b.get("type") == "tool_use":
+                out.append(("tool", tool_text(b.get("name"), b.get("input")),
+                            "%s#%d" % (uid, n), date))
+    return out
+
+
+def parse_pi(rec, raw):
+    msg = rec.get("message")
+    if rec.get("type") != "message" or not isinstance(msg, dict):
+        return []
+    role, content, date = msg.get("role"), msg.get("content"), \
+        local_date(rec.get("timestamp"))
+    key = "%s@%s" % (rec.get("id"), rec.get("timestamp"))
+    if role == "user":
+        return [("user", blocks_text(content), key, date)]
+    if role == "toolResult":
+        return [("echo", blocks_text(content), key, date)]
+    out = []
+    if role == "assistant":
+        for n, b in enumerate(x for x in content or [] if isinstance(x, dict)):
+            if b.get("type") == "text":
+                out.append(("unii", b.get("text") or "", "%s#%d" % (key, n), date))
+            elif b.get("type") == "toolCall":
+                out.append(("tool", tool_text(b.get("name"), b.get("arguments")),
+                            "%s#%d" % (key, n), date))
+    return out
+
+
+def parse_codex(rec, raw):
+    """Codex rollout line. The user's words come from the UserMessage item;
+    the injected context messages (AGENTS.md, environment) are not those."""
+    kind, p = rec.get("type"), rec.get("payload")
+    if not isinstance(p, dict):
+        return []
+    date, key, pt = local_date(rec.get("timestamp")), sha(raw, 20), p.get("type")
+    if kind == "event_msg" and pt == "item_completed":
+        item = p.get("item") or {}
+        if item.get("type") == "UserMessage":
+            return [("user", blocks_text(item.get("content")), key, date)]
+    elif kind == "response_item":
+        if pt == "message" and p.get("role") == "assistant":
+            return [("unii", blocks_text(p.get("content")), key, date)]
+        if pt == "function_call":
+            return [("tool", tool_text(p.get("name"), p.get("arguments")),
+                     key, date)]
+        if pt == "custom_tool_call":
+            return [("tool", tool_text(p.get("name"), {"input": p.get("input")}),
+                     key, date)]
+        if pt in ("local_shell_call", "web_search_call"):
+            return [("tool", tool_text(pt[:-5], p.get("action")), key, date)]
+        if pt in ("function_call_output", "custom_tool_call_output"):
+            out = p.get("output")
+            text = blocks_text(out) if isinstance(out, (str, list, dict)) else ""
+            return [("echo", text, key, date)]
+    return []
+
+
+PARSERS = {"claude": parse_claude, "codex": parse_codex, "pi": parse_pi}
+
+
+def codex_is_interactive(path):
+    """The first line of a rollout names its source: exec runs and subagent
+    threads are not the captain's interactive session."""
+    try:
+        with open(path, "rb") as f:
+            meta = json.loads(f.readline())
+        p = meta.get("payload") or {}
+        return (meta.get("type") == "session_meta"
+                and p.get("source") not in ("exec",)
+                and isinstance(p.get("source"), str)
+                and p.get("thread_source") != "subagent")
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+class Cursors:
+    """capture/: one cursor per session file (byte offset, and the message
+    count before an append that may not have finished), the keys of every
+    captured message in 256 shard files, a queue and an error log."""
+
+    def __init__(self, store):
+        self.store, self.shards = store, {}
+
+    def path(self, *parts):
+        return self.store.p(os.path.join("capture", *parts))
+
+    def ensure(self):
+        for d in ("cursors", "seen", "queue"):
+            os.makedirs(self.path(d), exist_ok=True)
+
+    def load(self, harness, file):
+        try:
+            with open(self.path("cursors", "%s-%s.json" % (harness, sha(file))),
+                      encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, harness, file, cur):
+        p = self.path("cursors", "%s-%s.json" % (harness, sha(file)))
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(cur, f, separators=(",", ":"))
+        os.replace(p + ".tmp", p)
+
+    def _shard(self, key):
+        h = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()
+        if h[:2] not in self.shards:
+            try:
+                with open(self.path("seen", h[:2]), encoding="ascii") as f:
+                    self.shards[h[:2]] = set(f.read().split())
+            except OSError:
+                self.shards[h[:2]] = set()
+        return h[:2], h[2:22]
+
+    def seen(self, key):
+        d, h = self._shard(key)
+        return h in self.shards[d]
+
+    def mark(self, key):
+        d, h = self._shard(key)
+        if h not in self.shards[d]:
+            self.shards[d].add(h)
+            with open(self.path("seen", d), "a", encoding="ascii") as f:
+                f.write(h + "\n")
+
+    def error(self, harness, text):
+        """Record an error for the captain to read. Never raises."""
+        try:
+            os.makedirs(self.path(), exist_ok=True)
+            log = self.path("errors.log")
+            if os.path.getsize(log) > ERROR_LOG_MAX:
+                os.replace(log, log + ".1")
+        except OSError:
+            pass
+        try:
+            with open(self.path("errors.log"), "a", encoding="utf-8") as f:
+                f.write("%s %s %s\n" % (now(), harness,
+                                        one_line(str(text))[:500]))
+        except OSError:
+            pass
+
+
+def read_new(path, offset):
+    """Complete lines after offset: (bytes, new offset)."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read(READ_MAX)
+    end = data.rfind(b"\n") + 1
+    return data[:end], offset + end
+
+
+def capture_messages(harness, sid, items):
+    """Redacted, prefixed, clipped and split messages for the log."""
+    prefix = "[%s %s] " % (harness, sha(sid or "", 4))
+    msgs = []
+    for kind, text, key, date in items:
+        text = redact(text)
+        if not text.strip():
+            if kind != "echo":
+                continue
+            text = "(no output)"
+        text = prefix + text
+        if kind in ("tool", "echo"):
+            text = clip_echo(text)
+        msgs += [(kind, part, date, key) for part in split_text(text)]
+    return msgs
+
+
+def capture(store, harness, payload, wait):
+    """Append what is new in one session file. Returns the messages added.
+    Raises Busy if the writer lock stays taken. Safe to repeat: the cursor
+    gives the place in the file, and each message's key is recorded."""
+    file = os.path.abspath(os.path.expanduser(
+        payload.get("transcript_path") or payload.get("session_file") or ""))
+    if not os.path.isfile(file):
+        return 0
+    sid = str(payload.get("session_id") or sha(file))
+    cur = Cursors(store)
+    cur.ensure()
+    for _ in range(5):
+        state = cur.load(harness, file)
+        if state.get("skip"):
+            return 0
+        offset = state.get("offset", 0)
+        if os.path.getsize(file) < offset:
+            offset = 0
+        if offset == 0 and harness == "codex" and not codex_is_interactive(file):
+            with store.writer(wait):
+                cur.save(harness, file, {"skip": True})
+            return 0
+        data, end = read_new(file, offset)
+        if end == offset:
+            return 0
+        items = []
+        for line in data.splitlines():
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    items += PARSERS[harness](rec, line.decode("utf-8", "replace"))
+            except (ValueError, AttributeError, TypeError) as e:
+                cur.error(harness, "bad line in %s: %s" % (os.path.basename(file), e))
+        with store.writer(wait):
+            now_state = cur.load(harness, file)
+            if now_state.get("offset", 0) != state.get("offset", 0):
+                continue  # another hook moved the cursor: read again
+            if now_state.get("pending") is not None:
+                for i in range(now_state["pending"], store.main.count()):
+                    if store.main.get(i).get("k"):
+                        cur.mark(store.main.get(i)["k"])
+            fresh = [it for it in items if not cur.seen(it[2])]
+            msgs = capture_messages(harness, sid, fresh)
+            if msgs:
+                cur.save(harness, file, dict(state, pending=store.main.count()))
+                store.add_messages(msgs)
+                for m in msgs:
+                    cur.mark(m[3])
+            cur.save(harness, file, {"offset": end, "path": file, "sid": sid})
+            return len(msgs)
+    raise Busy()
+
+
+def wait_for_reply(payload):
+    """A Stop hook can run before the transcript holds the last reply: wait
+    a moment for its first line to show up in the end of the file."""
+    reply = payload.get("last_assistant_message")
+    path = os.path.expanduser(payload.get("transcript_path") or "")
+    if not (isinstance(reply, str) and reply.strip()) or not os.path.isfile(path):
+        return
+    lines = reply.strip().splitlines()
+    needle = json.dumps(lines[0][:80], ensure_ascii=False)[1:-1].encode()
+    end = time.time() + SETTLE
+    while time.time() < end:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 200000))
+            if needle in f.read():
+                return
+        time.sleep(0.2)
+
+
+def spawn_drain(store):
+    probe = open(store.p("capture/.drain.lock"), "a")
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    finally:
+        probe.close()
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--store",
+                      store.path, "capture", "--drain"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def queue_capture(store, harness, payload):
+    cur = Cursors(store)
+    cur.ensure()
+    name = "%d-%d.json" % (time.time_ns(), os.getpid())
+    keep = {k: payload[k] for k in ("session_id", "transcript_path",
+                                    "session_file") if k in payload}
+    with open(cur.path("queue", name + ".tmp"), "w", encoding="utf-8") as f:
+        json.dump({"harness": harness, "payload": keep}, f)
+    os.replace(cur.path("queue", name + ".tmp"), cur.path("queue", name))
+    spawn_drain(store)
+
+
+def drain(store, tries=DRAIN_TRIES, pause=0.5):
+    """Work off the queue: the captures that found the writer lock taken.
+    One drain runs at a time. A capture that never gets through is dropped:
+    its cursor did not move, so the next hook of that session reads it."""
+    lock = open(store.p("capture/.drain.lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return
+    cur = Cursors(store)
+    try:
+        while True:
+            names = sorted(n for n in os.listdir(cur.path("queue"))
+                           if n.endswith(".json"))
+            if not names:
+                return
+            for name in names:
+                path = cur.path("queue", name)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        job = json.load(f)
+                    for attempt in range(tries):
+                        try:
+                            capture(store, job["harness"], job["payload"], DRAIN_WAIT)
+                            break
+                        except Busy:
+                            time.sleep(pause)
+                    else:
+                        cur.error(job["harness"], "gave up: writer lock busy")
+                except Exception as e:  # a bad queue file must not stop the rest
+                    cur.error("drain", "%s: %s" % (name, e))
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    finally:
+        lock.close()
+
+
+def cmd_capture(store, args, out):
+    """memo capture HARNESS < hook payload. Never raises into the harness:
+    a failure goes to capture/errors.log in the store."""
+    if args == ["--drain"]:
+        if store.exists():
+            drain(store)
+        return
+    if len(args) != 1 or args[0] not in HARNESSES:
+        raise Die("usage: %s capture %s   (the hook payload on stdin)"
+                  % (ME, "|".join(HARNESSES)))
+    harness = args[0]
+    if any(os.environ.get(v) for v in SKIP_ENV):
+        return
+    if not store.exists():
+        print("memo capture: no chat at %s" % pretty(store.path), file=sys.stderr)
+        return
+    cur = Cursors(store)
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not an object")
+        if payload.get("agent_id") or payload.get("mode") not in (None, "tui"):
+            return  # a subagent, or a Pi that is not interactive
+        if payload.get("hook_event_name") == "Stop":
+            wait_for_reply(payload)
+        try:
+            capture(store, harness, payload,
+                    float(os.environ.get("UNIICHAT_CAPTURE_WAIT") or LOCK_WAIT))
+        except Busy:
+            queue_capture(store, harness, payload)
+    except Exception as e:  # never into the harness
+        cur.error(harness, "%s: %s" % (type(e).__name__, e))
 
 
 # ------------------------------------------------------------ commands
@@ -1023,8 +1619,21 @@ def cmd_status(store, args, out):
     out("compaction %d lines, %d bytes%s" % (
         len(s.compact), sum(store.size(*k) for k in s.compact),
         ", merging" if s.compact_merging else ""))
-    out("model      %s via %s, thinking %s" % (cfg.model, cfg.backend,
-                                              cfg.thinking))
+    out("model      %s (%s) via %s, thinking %s" % (
+        cfg.model, cfg.provider, cfg.backend, cfg.thinking))
+    cdir = store.p("capture")
+    try:
+        sessions = len(os.listdir(os.path.join(cdir, "cursors")))
+        queued = len(os.listdir(os.path.join(cdir, "queue")))
+    except OSError:
+        sessions = queued = 0
+    try:
+        with open(os.path.join(cdir, "errors.log"), encoding="utf-8") as f:
+            errors = sum(1 for _ in f)
+    except OSError:
+        errors = 0
+    out("capture    %d session files followed, %d queued, %d error lines"
+        % (sessions, queued, errors))
     out("store      %s" % pretty(store.path))
 
 
@@ -1078,7 +1687,7 @@ def cmd_import(store, args, out):
 
 COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
             "zoom": cmd_zoom, "date": cmd_date, "compact": cmd_compact,
-            "status": cmd_status, "import": cmd_import}
+            "status": cmd_status, "import": cmd_import, "capture": cmd_capture}
 NO_WORKER = ("init", "compact", "status")
 
 

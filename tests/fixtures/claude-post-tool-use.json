@@ -1,0 +1,16 @@
+{
+  "session_id": "@SID@",
+  "transcript_path": "@FILE@",
+  "cwd": "/work/app",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "pytest -q"
+  },
+  "tool_response": {
+    "stdout": "3 passed"
+  },
+  "tool_use_id": "toolu_2",
+  "duration_ms": 12
+}
