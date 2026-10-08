@@ -1060,7 +1060,7 @@ SECRETS = [
      "[REDACTED]"),
     (re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]{20,}", re.I), r"\1[REDACTED]"),
     (re.compile(
-        r"(\b[A-Z0-9_.-]*(?:api[_-]?key|secret|token|passw(?:or)?d"
+        r"((?:api[_-]?key|secret|token|passw(?:or)?d"
         r"|private[_-]?key|access[_-]?key|credential)[A-Z0-9_.-]*[\"']?\s*[:=]"
         r"\s*[\"']?)(?![$<{])[^\s\"',;]{8,}", re.I), r"\1[REDACTED]"),
 ]
@@ -1302,6 +1302,11 @@ def read_new(path, offset):
     with open(path, "rb") as f:
         f.seek(offset)
         data = f.read(READ_MAX)
+        while b"\n" not in data:
+            more = f.read(READ_MAX)
+            if not more:
+                break
+            data += more
     end = data.rfind(b"\n") + 1
     return data[:end], offset + end
 
@@ -1311,7 +1316,6 @@ def capture_messages(harness, sid, items):
     prefix = "[%s %s] " % (harness, sha(sid or "", 4))
     msgs = []
     for kind, text, key, date in items:
-        text = redact(text)
         if not text.strip():
             if kind != "echo":
                 continue
@@ -1319,6 +1323,7 @@ def capture_messages(harness, sid, items):
         text = prefix + text
         if kind in ("tool", "echo"):
             text = clip_echo(text)
+        text = redact(text)
         msgs += [(kind, part, date, key) for part in split_text(text)]
     return msgs
 
